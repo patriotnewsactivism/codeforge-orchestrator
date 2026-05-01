@@ -653,7 +653,7 @@ export async function runTester(
   await broadcastMessage(
     ctx,
     "warning",
-    `Sandbox failed with ${validation.errors.length} error(s): ${validation.errors.slice(0, 3).map(e => e.message).join("; ")}`,
+    `Sandbox failed with ${validation.errors.length} error(s): ${validation.errors.slice(0, 3).map(e => typeof e === 'string' ? e.substring(0, 100) : String(e)).join("; ")}`,
   );
 
   // Auto-fix attempt: send errors to AI for repair

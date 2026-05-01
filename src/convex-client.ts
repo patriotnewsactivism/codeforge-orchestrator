@@ -188,6 +188,100 @@ class ConvexClient {
   }): Promise<void> {
     await this.post("/api/swarm/sandbox", args);
   }
+  // ─── Memory Operations ───────────────────────────────
+
+  async getTopMemories(
+    projectId: string,
+    limit = 20,
+    category?: string
+  ): Promise<Array<{
+    _id: string;
+    category: string;
+    title: string;
+    content: string;
+    importance: number;
+    usageCount: number;
+  }>> {
+    const params: Record<string, string> = { projectId, limit: String(limit) };
+    if (category) params.category = category;
+    const data = await this.get<{ memories: any[] }>("/api/memory/top", params);
+    return data.memories;
+  }
+
+  async createMemory(args: {
+    projectId: string;
+    category: string;
+    title: string;
+    content: string;
+    importance?: number;
+    sourceTaskId?: string;
+    sourceAgentRole?: string;
+  }): Promise<string> {
+    const data = await this.post<{ memoryId: string }>("/api/memory/create", args);
+    return data.memoryId;
+  }
+
+  async useMemory(memoryId: string): Promise<void> {
+    await this.post("/api/memory/use", { memoryId });
+  }
+
+  // ─── Retrospective Operations ───────────────────────
+
+  async createRetrospective(args: {
+    taskId: string;
+    projectId: string;
+    taskSummary: string;
+    totalAgents: number;
+    totalFiles: number;
+    durationMs: number;
+    sandboxPassedFirst: boolean;
+    reviewPassedFirst: boolean;
+    retryCount: number;
+    whatWorked: string[];
+    whatFailed: string[];
+    improvements: string[];
+    newMemories: string[];
+    qualityScore: number;
+  }): Promise<string> {
+    const data = await this.post<{ retroId: string }>("/api/retrospective/create", args);
+    return data.retroId;
+  }
+
+  // ─── Agent Message Bus ──────────────────────────────
+
+  async sendAgentMessage(args: {
+    taskId: string;
+    projectId: string;
+    fromAgentUid: string;
+    fromAgentRole: string;
+    toAgentUid?: string;
+    toAgentRole?: string;
+    messageType: string;
+    content: string;
+  }): Promise<string> {
+    const data = await this.post<{ messageId: string }>("/api/agents/message", args);
+    return data.messageId;
+  }
+
+  async getMessagesForAgent(
+    taskId: string,
+    agentUid: string,
+    agentRole: string
+  ): Promise<Array<{
+    _id: string;
+    fromAgentUid: string;
+    fromAgentRole: string;
+    messageType: string;
+    content: string;
+    timestamp: number;
+  }>> {
+    const data = await this.get<{ messages: any[] }>("/api/agents/messages", {
+      taskId,
+      agentUid,
+      agentRole,
+    });
+    return data.messages;
+  }
 }
 
 export const convexClient = new ConvexClient();

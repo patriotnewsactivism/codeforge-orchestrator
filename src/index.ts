@@ -7,6 +7,7 @@
 import { config } from "./config.js";
 import { convexClient } from "./convex-client.js";
 import { orchestrateTask } from "./agents.js";
+import { cleanupAllSessions } from "./sandbox.js";
 
 const activeTasks = new Set<string>();
 
@@ -77,7 +78,21 @@ async function main(): Promise<void> {
   }
 }
 
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("[orchestrator] SIGTERM received — cleaning up sandbox sessions...");
+  cleanupAllSessions();
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  console.log("[orchestrator] SIGINT received — cleaning up sandbox sessions...");
+  cleanupAllSessions();
+  process.exit(0);
+});
+
 main().catch((err) => {
   console.error("[orchestrator] Fatal error:", err);
+  cleanupAllSessions();
   process.exit(1);
 });

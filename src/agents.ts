@@ -1,10 +1,13 @@
 /**
  * Agent Runners — Each agent role has a specialized prompt and behavior.
  * Agents execute via the AI model and write results back through the Convex client.
+ * 
+ * Phase 2: Agents now use sandbox execution for validation, testing, and debugging.
  */
 import { config } from "./config.js";
 import { convexClient, type ConvexFile } from "./convex-client.js";
 import { callAI, callAIJson } from "./ai.js";
+import { validateProject, createSession, execInSandbox, destroySession, type SandboxResult, type ValidationResult } from "./sandbox.js";
 
 // ═══════════════════════════════════════════════
 // Types
@@ -35,6 +38,16 @@ interface ReviewerOutput {
     file: string;
     issue: string;
     severity: "error" | "warning" | "suggestion";
+  }>;
+  summary: string;
+}
+
+interface TesterOutput {
+  testsPassed: boolean;
+  results: Array<{
+    name: string;
+    passed: boolean;
+    error?: string;
   }>;
   summary: string;
 }
@@ -89,6 +102,36 @@ function buildFileContext(files: ConvexFile[], maxChars = 40000): string {
 }
 
 // ═══════════════════════════════════════════════
+// Helper: Format sandbox result for AI context
+// ═══════════════════════════════════════════════
+
+function formatSandboxForAI(validation: ValidationResult): string {
+  const parts: string[] = [];
+
+  if (validation.installResult && validation.installResult.exitCode !== 0) {
+    parts.push(`=== NPM INSTALL FAILED (exit ${validation.installResult.exitCode}) ===\n${validation.installResult.stderr}`);
+  }
+
+  if (validation.typeCheckResult && validation.typeCheckResult.exitCode !== 0) {
+    parts.push(`=== TYPESCRIPT ERRORS ===\n${validation.typeCheckResult.stdout}\n${validation.typeCheckResult.stderr}`);
+  }
+
+  if (validation.buildResult && validation.buildResult.exitCode !== 0) {
+    parts.push(`=== BUILD FAILED (exit ${validation.buildResult.exitCode}) ===\n${validation.buildResult.stderr}`);
+  }
+
+  if (validation.testResult && validation.testResult.exitCode !== 0) {
+    parts.push(`=== TESTS FAILED (exit ${validation.testResult.exitCode}) ===\n${validation.testResult.stdout}\n${validation.testResult.stderr}`);
+  }
+
+  if (parts.length === 0) {
+    return "All sandbox checks passed — no errors found.";
+  }
+
+  return parts.join("\n\n");
+}
+
+// ═══════════════════════════════════════════════
 // PLANNER AGENT
 // ═══════════════════════════════════════════════
 
@@ -122,7 +165,7 @@ AVAILABLE AGENT ROLES:
 - architect: Designs file structure, component hierarchy, data models
 - coder: Writes actual code for specific files/modules
 - debugger: Fixes errors, handles edge cases
-- tester: Validates code works correctly
+- tester: Validates code by running sandbox checks (npm install, TypeScript compilation, tests)
 - reviewer: Reviews code quality before merge
 
 RULES:
@@ -131,13 +174,15 @@ RULES:
 3. Assign file ownership to coders to avoid conflicts
 4. If the task is simple (1-2 files), use fewer agents
 5. For complex tasks, use architect first, then coders
-6. Always end with a reviewer task
+6. ALWAYS include a tester task (runs sandbox validation on the code)
+7. Always end with a reviewer task
 
 Return ONLY JSON (no markdown):
 {
   "subtasks": [
     { "role": "architect", "assignment": "Design the file structure for...", "files": ["path1", "path2"] },
     { "role": "coder", "assignment": "Implement the login component in...", "files": ["src/login.tsx"] },
+    { "role": "tester", "assignment": "Run sandbox validation: npm install, type-check, and build" },
     { "role": "reviewer", "assignment": "Review all changes for quality and consistency" }
   ],
   "summary": "Brief plan summary"
@@ -297,7 +342,127 @@ Return ONLY JSON (no markdown):
 }
 
 // ═══════════════════════════════════════════════
-// DEBUGGER AGENT
+// TESTER AGENT — Phase 2: Sandbox Execution
+// ═══════════════════════════════════════════════
+
+export async function runTester(
+  ctx: AgentContext,
+  files: ConvexFile[]
+): Promise<{ validation: ValidationResult; coderOutput?: CoderOutput }> {
+  await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "running");
+  await convexClient.logEvent({
+    taskId: ctx.taskId,
+    projectId: ctx.projectId,
+    agentUid: ctx.agentUid,
+    agentRole: "tester",
+    type: "sandbox_run",
+    content: `Starting sandbox validation: install → type-check → build`,
+  });
+
+  // Run full sandbox validation
+  const validation = await validateProject(
+    ctx.taskId,
+    ctx.projectId,
+    ctx.agentUid,
+    files,
+    {
+      runBuild: true,
+      runTests: true,
+      logToConvex: true,
+    }
+  );
+
+  // Log results
+  if (validation.passed) {
+    await convexClient.logEvent({
+      taskId: ctx.taskId,
+      projectId: ctx.projectId,
+      agentUid: ctx.agentUid,
+      agentRole: "tester",
+      type: "test_pass",
+      content: `✅ Sandbox validation passed: ${validation.summary}`,
+    });
+
+    await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "done", {
+      result: `Sandbox validation passed — all checks green`,
+    });
+
+    return { validation };
+  }
+
+  // Validation failed — ask AI to fix the issues
+  await convexClient.logEvent({
+    taskId: ctx.taskId,
+    projectId: ctx.projectId,
+    agentUid: ctx.agentUid,
+    agentRole: "tester",
+    type: "test_fail",
+    content: `❌ Sandbox validation failed: ${validation.errors.length} error(s)`,
+    metadata: JSON.stringify(validation.errors),
+  });
+
+  // Auto-fix attempt: send errors to AI for repair
+  const fileContext = buildFileContext(files);
+  const sandboxOutput = formatSandboxForAI(validation);
+
+  const fixPrompt = `You are a Tester agent that just ran sandbox validation on a project. The validation FAILED.
+Fix ALL errors so the code compiles and runs correctly.
+
+SANDBOX OUTPUT:
+${sandboxOutput}
+
+CURRENT PROJECT FILES:
+${fileContext}
+
+Fix every error. Return the corrected files with FULL updated content.
+Return ONLY JSON (no markdown):
+{
+  "changes": [
+    { "path": "src/file.tsx", "action": "edit", "content": "full corrected file content" }
+  ],
+  "summary": "What was fixed to pass sandbox validation"
+}`;
+
+  try {
+    const fixes = await callAIJson<CoderOutput>(fixPrompt);
+
+    // Write fixes
+    for (const change of fixes.changes) {
+      const cleanContent = change.content
+        .replace(/^```[\w]*\n?/, "")
+        .replace(/\n?```$/, "")
+        .trim();
+
+      if (change.action !== "delete") {
+        await convexClient.writeFile(ctx.projectId, change.path, cleanContent);
+        await convexClient.logEvent({
+          taskId: ctx.taskId,
+          projectId: ctx.projectId,
+          agentUid: ctx.agentUid,
+          agentRole: "tester",
+          type: "error_fixed",
+          content: `Auto-fixed ${change.path}`,
+          metadata: JSON.stringify({ path: change.path }),
+        });
+      }
+    }
+
+    await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "done", {
+      result: `Sandbox validation failed, auto-fixed ${fixes.changes.length} files: ${fixes.summary}`,
+    });
+
+    return { validation, coderOutput: fixes };
+  } catch (fixError) {
+    await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "done", {
+      result: `Sandbox validation failed with ${validation.errors.length} errors. Auto-fix attempted.`,
+    });
+
+    return { validation };
+  }
+}
+
+// ═══════════════════════════════════════════════
+// DEBUGGER AGENT — Phase 2: Sandbox-Powered
 // ═══════════════════════════════════════════════
 
 export async function runDebugger(
@@ -315,17 +480,39 @@ export async function runDebugger(
     content: `Debugging: ${ctx.assignment}`,
   });
 
+  // Phase 2: Run sandbox to get real errors
+  await convexClient.logEvent({
+    taskId: ctx.taskId,
+    projectId: ctx.projectId,
+    agentUid: ctx.agentUid,
+    agentRole: "debugger",
+    type: "sandbox_run",
+    content: `Running sandbox to capture actual errors...`,
+  });
+
+  const validation = await validateProject(
+    ctx.taskId,
+    ctx.projectId,
+    ctx.agentUid,
+    files,
+    { logToConvex: true }
+  );
+
+  const sandboxErrors = formatSandboxForAI(validation);
   const fileContext = buildFileContext(files);
 
-  const prompt = `You are a Debugger agent. Find and fix bugs in the code.
+  const prompt = `You are a Debugger agent with access to REAL sandbox execution results. Fix all bugs.
 
 TASK: ${ctx.assignment}
 
-${errorContext ? `ERROR CONTEXT:\n${errorContext}\n\n` : ""}EXISTING PROJECT FILES:
+${errorContext ? `REPORTED ERROR CONTEXT:\n${errorContext}\n\n` : ""}SANDBOX EXECUTION RESULTS:
+${sandboxErrors}
+
+EXISTING PROJECT FILES:
 ${fileContext}
 
-Analyze the code for bugs, missing imports, type errors, and logic issues.
-Fix everything you find. Return the corrected files with FULL content.
+Analyze the REAL errors from the sandbox execution. Fix everything — missing imports, type errors, logic issues.
+Return the corrected files with FULL content.
 
 Return ONLY JSON (no markdown):
 {
@@ -357,15 +544,40 @@ Return ONLY JSON (no markdown):
     }
   }
 
+  // Phase 2: Re-validate after fixes
+  const updatedFiles = await convexClient.getProjectFiles(ctx.projectId);
+  const revalidation = await validateProject(
+    ctx.taskId,
+    ctx.projectId,
+    ctx.agentUid,
+    updatedFiles,
+    { logToConvex: true }
+  );
+
+  const statusMsg = revalidation.passed
+    ? `${result.summary} — sandbox re-validation PASSED ✅`
+    : `${result.summary} — some issues remain after fix (${revalidation.errors.length} errors)`;
+
+  await convexClient.logEvent({
+    taskId: ctx.taskId,
+    projectId: ctx.projectId,
+    agentUid: ctx.agentUid,
+    agentRole: "debugger",
+    type: revalidation.passed ? "test_pass" : "test_fail",
+    content: revalidation.passed
+      ? `✅ Post-fix sandbox validation passed`
+      : `⚠️ Post-fix sandbox still has ${revalidation.errors.length} error(s)`,
+  });
+
   await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "done", {
-    result: result.summary,
+    result: statusMsg,
   });
 
   return result;
 }
 
 // ═══════════════════════════════════════════════
-// REVIEWER AGENT
+// REVIEWER AGENT — Phase 2: Sandbox-Informed
 // ═══════════════════════════════════════════════
 
 export async function runReviewer(
@@ -382,22 +594,51 @@ export async function runReviewer(
     content: `Reviewing code quality: ${ctx.assignment}`,
   });
 
+  // Phase 2: Run sandbox check as part of review
+  await convexClient.logEvent({
+    taskId: ctx.taskId,
+    projectId: ctx.projectId,
+    agentUid: ctx.agentUid,
+    agentRole: "reviewer",
+    type: "sandbox_run",
+    content: `Running sandbox validation as part of review...`,
+  });
+
+  const validation = await validateProject(
+    ctx.taskId,
+    ctx.projectId,
+    ctx.agentUid,
+    files,
+    { logToConvex: true }
+  );
+
+  const sandboxInfo = formatSandboxForAI(validation);
   const fileContext = buildFileContext(files);
 
   const prompt = `You are a Reviewer agent. Check code quality, consistency, and correctness.
+You also have REAL sandbox execution results to base your review on.
 
 TASK: Review the project after: ${ctx.assignment}
+
+SANDBOX EXECUTION RESULTS:
+${sandboxInfo}
+
+${!validation.passed ? "⚠️ SANDBOX FAILED — there are real compilation/runtime errors that MUST be flagged." : "✅ SANDBOX PASSED — code compiles and runs."}
 
 PROJECT FILES:
 ${fileContext}
 
 Check for:
-1. Missing imports or exports
-2. Inconsistent naming or patterns
-3. Potential runtime errors
-4. Security issues
-5. Missing error handling
-6. Broken references between files
+1. REAL errors from sandbox (these are confirmed bugs, not guesses)
+2. Missing imports or exports
+3. Inconsistent naming or patterns
+4. Potential runtime errors
+5. Security issues
+6. Missing error handling
+7. Broken references between files
+
+If sandbox passed and code quality is good, approve.
+If sandbox failed, REJECT and list all real errors.
 
 Return ONLY JSON (no markdown):
 {
@@ -410,6 +651,16 @@ Return ONLY JSON (no markdown):
 
   const result = await callAIJson<ReviewerOutput>(prompt);
 
+  // If sandbox failed, force rejection regardless of AI opinion
+  if (!validation.passed && result.approved) {
+    result.approved = false;
+    result.issues.push({
+      file: "project",
+      issue: `Sandbox validation failed: ${validation.errors.join("; ")}`,
+      severity: "error",
+    });
+  }
+
   const eventType = result.approved ? "review_pass" : "review_fail";
   await convexClient.logEvent({
     taskId: ctx.taskId,
@@ -418,7 +669,7 @@ Return ONLY JSON (no markdown):
     agentRole: "reviewer",
     type: eventType,
     content: result.approved
-      ? `✓ Review passed: ${result.summary}`
+      ? `✓ Review passed (sandbox ✅): ${result.summary}`
       : `✗ Review failed (${result.issues.length} issues): ${result.summary}`,
     metadata: JSON.stringify(result.issues),
   });
@@ -475,11 +726,12 @@ export async function orchestrateTask(task: {
     });
 
     // ── Step 2: Execute sub-tasks ────────────────
-    // Separate by role priority: architects first, then coders in parallel, then reviewer
+    // Separate by role priority: architects first, then coders in parallel, then tester, then reviewer
     const architects = plan.subtasks.filter((s) => s.role === "architect");
     const coders = plan.subtasks.filter((s) => s.role === "coder");
+    const testers = plan.subtasks.filter((s) => s.role === "tester");
     const others = plan.subtasks.filter(
-      (s) => !["architect", "coder", "reviewer"].includes(s.role)
+      (s) => !["architect", "coder", "tester", "reviewer"].includes(s.role)
     );
     const reviewers = plan.subtasks.filter((s) => s.role === "reviewer");
 
@@ -544,7 +796,7 @@ export async function orchestrateTask(task: {
       files = await convexClient.getProjectFiles(projectId);
     }
 
-    // Run other agents (debuggers, testers, etc.) sequentially
+    // Run other agents (debuggers, etc.) sequentially
     for (const sub of others) {
       const uid = nextAgentUid(taskId, sub.role);
       totalAgents++;
@@ -577,9 +829,57 @@ export async function orchestrateTask(task: {
       }
     }
 
-    // ── Step 3: Review ───────────────────────────
+    // ── Step 3: Tester — Sandbox Validation ──────
     await convexClient.updateTaskStatus(taskId, "verifying");
 
+    // Run testers (sandbox validation)
+    for (const sub of testers) {
+      const uid = nextAgentUid(taskId, "tester");
+      totalAgents++;
+      await convexClient.spawnAgent({
+        taskId,
+        projectId,
+        agentUid: uid,
+        parentAgentUid: plannerUid,
+        role: "tester",
+        assignment: sub.assignment || "Run sandbox validation: npm install, type-check, build",
+        depth: 1,
+      });
+      const testerResult = await runTester(
+        { taskId, projectId, agentUid: uid, role: "tester", assignment: sub.assignment || "Validate code", depth: 1, parentAgentUid: plannerUid },
+        files
+      );
+      if (testerResult.coderOutput) {
+        totalFilesChanged += testerResult.coderOutput.changes.length;
+      }
+      // Refresh files after tester fixes
+      files = await convexClient.getProjectFiles(projectId);
+    }
+
+    // If no tester was planned, still run one automatically
+    if (testers.length === 0) {
+      const uid = nextAgentUid(taskId, "tester");
+      totalAgents++;
+      await convexClient.spawnAgent({
+        taskId,
+        projectId,
+        agentUid: uid,
+        parentAgentUid: plannerUid,
+        role: "tester",
+        assignment: "Automatic sandbox validation",
+        depth: 1,
+      });
+      const testerResult = await runTester(
+        { taskId, projectId, agentUid: uid, role: "tester", assignment: "Validate all code changes", depth: 1, parentAgentUid: plannerUid },
+        files
+      );
+      if (testerResult.coderOutput) {
+        totalFilesChanged += testerResult.coderOutput.changes.length;
+      }
+      files = await convexClient.getProjectFiles(projectId);
+    }
+
+    // ── Step 4: Review with self-healing loop ────
     let reviewPassed = false;
     let retryCount = 0;
 
@@ -607,7 +907,7 @@ export async function orchestrateTask(task: {
       } else {
         retryCount++;
         if (retryCount < config.maxRetryLoops) {
-          // Spawn debugger to fix review issues
+          // Spawn debugger to fix review issues (now with sandbox!)
           const debugUid = nextAgentUid(taskId, "debugger");
           totalAgents++;
           const issuesSummary = review.issues
@@ -643,14 +943,14 @@ export async function orchestrateTask(task: {
       }
     }
 
-    // ── Step 4: Complete ─────────────────────────
+    // ── Step 5: Complete ─────────────────────────
     await convexClient.logEvent({
       taskId,
       projectId,
       agentUid: "system",
       agentRole: "system",
       type: "task_complete",
-      content: `Task complete — ${totalAgents} agents, ${totalFilesChanged} files changed`,
+      content: `Task complete — ${totalAgents} agents spawned, ${totalFilesChanged} files changed, sandbox-validated ✅`,
     });
 
     await convexClient.updateTaskStatus(taskId, "completed", {
@@ -659,7 +959,7 @@ export async function orchestrateTask(task: {
     });
 
     console.log(
-      `[orchestrator] Task ${taskId} completed: ${totalAgents} agents, ${totalFilesChanged} files`
+      `[orchestrator] Task ${taskId} completed: ${totalAgents} agents, ${totalFilesChanged} files (sandbox-validated)`
     );
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);

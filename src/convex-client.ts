@@ -282,6 +282,72 @@ class ConvexClient {
     });
     return data.messages;
   }
+  // ═══════════════════════════════════════════════
+  // Codebase RAG
+  // ═══════════════════════════════════════════════
+
+  async indexProjectFiles(
+    projectId: string,
+    files: Array<{ path: string; content: string; language?: string }>
+  ): Promise<{ totalChunks: number; filesIndexed: number }> {
+    return this.post("/api/rag/index", { projectId, files });
+  }
+
+  async indexFile(
+    projectId: string,
+    path: string,
+    content: string,
+    language?: string
+  ): Promise<{ chunks: number }> {
+    return this.post("/api/rag/index-file", { projectId, path, content, language });
+  }
+
+  async searchCode(
+    projectId: string,
+    query: string,
+    limit = 15
+  ): Promise<Array<{
+    filePath: string;
+    chunkType: string;
+    name?: string;
+    content: string;
+    startLine: number;
+    endLine: number;
+  }>> {
+    const data = await this.get<{ chunks: any[] }>("/api/rag/search", {
+      projectId,
+      query,
+      limit: String(limit),
+    });
+    return data.chunks;
+  }
+
+  // ═══════════════════════════════════════════════
+  // Git Integration
+  // ═══════════════════════════════════════════════
+
+  async createGitBranch(
+    taskId: string,
+    projectId: string,
+    branchName: string,
+    baseBranch = "main"
+  ): Promise<string> {
+    const data = await this.post<{ id: string }>("/api/git/branch", {
+      taskId,
+      projectId,
+      branchName,
+      baseBranch,
+    });
+    return data.id;
+  }
+
+  async addGitCommit(taskId: string, commitSHA: string): Promise<void> {
+    await this.post("/api/git/commit", { taskId, commitSHA });
+  }
+
+  async setGitPR(taskId: string, prNumber: number, prUrl: string): Promise<void> {
+    await this.post("/api/git/pr", { taskId, prNumber, prUrl });
+  }
 }
 
 export const convexClient = new ConvexClient();

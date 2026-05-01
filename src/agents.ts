@@ -9,6 +9,7 @@ import { config } from "./config.js";
 import { convexClient, type ConvexFile } from "./convex-client.js";
 import { callAI, callAIJson } from "./ai.js";
 import { validateProject, createSession, execInSandbox, destroySession, type SandboxResult, type ValidationResult } from "./sandbox.js";
+import { isGitEnabled, createBranch, commitFiles, createPR, generateBranchName } from "./git.js";
 
 // ═══════════════════════════════════════════════
 // Types
@@ -100,6 +101,61 @@ function buildFileContext(files: ConvexFile[], maxChars = 40000): string {
     ctx += entry;
   }
   return ctx;
+}
+
+/**
+ * RAG-powered context: search for relevant code chunks instead of dumping all files.
+ * Falls back to buildFileContext if RAG index is empty.
+ */
+async function buildRAGContext(
+  projectId: string,
+  query: string,
+  files: ConvexFile[],
+  maxChunks = 15
+): Promise<string> {
+  try {
+    const chunks = await convexClient.searchCode(projectId, query, maxChunks);
+    if (chunks.length === 0) {
+      // No RAG index yet — fall back to full file context
+      return buildFileContext(files);
+    }
+
+    let ctx = "=== RELEVANT CODE (from RAG search) ===\n\n";
+    for (const chunk of chunks) {
+      ctx += `--- ${chunk.filePath} [${chunk.chunkType}${chunk.name ? `: ${chunk.name}` : ""}] (L${chunk.startLine}-${chunk.endLine}) ---\n`;
+      ctx += chunk.content + "\n\n";
+    }
+
+    // Also add a file tree for full project awareness
+    const tree = files
+      .filter((f) => !f.isDirectory)
+      .map((f) => f.path)
+      .join("\n");
+    ctx += `\n=== FULL FILE TREE ===\n${tree}\n`;
+
+    return ctx;
+  } catch (err) {
+    console.error("[rag] Search failed, falling back to file context:", err);
+    return buildFileContext(files);
+  }
+}
+
+/**
+ * Index project files into RAG chunks. Called at the start of each task.
+ */
+async function indexProjectForRAG(projectId: string, files: ConvexFile[]): Promise<void> {
+  try {
+    const codeFiles = files
+      .filter((f) => !f.isDirectory && f.content.length > 0)
+      .map((f) => ({ path: f.path, content: f.content, language: f.language }));
+
+    if (codeFiles.length === 0) return;
+
+    const result = await convexClient.indexProjectFiles(projectId, codeFiles);
+    console.log(`[rag] Indexed ${result.filesIndexed} files → ${result.totalChunks} chunks`);
+  } catch (err) {
+    console.error("[rag] Indexing failed (non-critical):", err);
+  }
 }
 
 // ═══════════════════════════════════════════════
@@ -521,7 +577,8 @@ export async function runCoder(
     content: `Writing code: ${ctx.assignment}`,
   });
 
-  const fileContext = buildFileContext(files);
+  // Use RAG for smarter context — search for code relevant to this task
+  const fileContext = await buildRAGContext(ctx.projectId, ctx.assignment, files);
 
   // Inject memory + messages from other agents
   const memoryContext = await buildMemoryContext(ctx.projectId);
@@ -975,6 +1032,27 @@ export async function orchestrateTask(task: {
     // Get current project files
     let files = await convexClient.getProjectFiles(projectId);
 
+    // ── Step 0a: Index project files for RAG ─────
+    await indexProjectForRAG(projectId, files);
+
+    // ── Step 0b: Create git branch (if GitHub connected) ──
+    let gitBranchName: string | null = null;
+    if (isGitEnabled()) {
+      gitBranchName = generateBranchName(taskId, prompt);
+      const created = await createBranch(gitBranchName);
+      if (created) {
+        await convexClient.createGitBranch(taskId, projectId, gitBranchName).catch(() => {});
+        await convexClient.logEvent({
+          taskId,
+          projectId,
+          agentUid: "system",
+          agentRole: "system",
+          type: "thinking",
+          content: `Git branch created: ${gitBranchName}`,
+        });
+      }
+    }
+
     // ── Step 1: Planner ──────────────────────────
     const plannerUid = nextAgentUid(taskId, "planner");
     await convexClient.spawnAgent({
@@ -1218,6 +1296,51 @@ export async function orchestrateTask(task: {
           totalFilesChanged += debugResult.changes.length;
           files = await convexClient.getProjectFiles(projectId);
         }
+      }
+    }
+
+    // ── Step 4b: Git commit + PR ──────────────────
+    if (gitBranchName && isGitEnabled()) {
+      try {
+        // Collect all changed files for commit
+        const finalFiles = await convexClient.getProjectFiles(projectId);
+        const codeFiles = finalFiles
+          .filter((f) => !f.isDirectory && f.content.length > 0)
+          .map((f) => ({ path: f.path, content: f.content }));
+
+        const commitSha = await commitFiles(
+          gitBranchName,
+          codeFiles,
+          `[CodeForge] ${prompt.substring(0, 72)}`
+        );
+
+        if (commitSha) {
+          await convexClient.addGitCommit(taskId, commitSha).catch(() => {});
+
+          // Create PR
+          const pr = await createPR(
+            gitBranchName,
+            `[CodeForge] ${prompt.substring(0, 72)}`,
+            `## Autonomous Swarm Task\n\n**Prompt:** ${prompt}\n\n**Stats:** ${totalAgents} agents spawned, ${totalFilesChanged} files changed\n\n*Generated by CodeForge Agent Swarm*`
+          );
+
+          if (pr) {
+            await convexClient.setGitPR(taskId, pr.number, pr.url).catch(() => {});
+            await convexClient.logEvent({
+              taskId,
+              projectId,
+              agentUid: "system",
+              agentRole: "system",
+              type: "task_complete",
+              content: `PR created: ${pr.url}`,
+            });
+          }
+        }
+
+        // Re-index project after changes
+        await indexProjectForRAG(projectId, finalFiles);
+      } catch (err) {
+        console.error("[git] Post-task git operations failed (non-critical):", err);
       }
     }
 

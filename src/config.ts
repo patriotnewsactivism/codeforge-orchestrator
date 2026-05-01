@@ -31,4 +31,9 @@ export const config = {
 
   /** Max retry loops for debug/fix cycle */
   maxRetryLoops: parseInt(process.env.MAX_RETRY_LOOPS ?? "5", 10),
+
+  /** GitHub integration (optional — set to enable git features) */
+  githubRepo: process.env.GITHUB_REPO ?? "",           // "owner/repo"
+  githubToken: process.env.GITHUB_TOKEN ?? "",          // PAT with repo scope
+  githubBaseBranch: process.env.GITHUB_BASE_BRANCH ?? "main",
 };

@@ -42,37 +42,21 @@ async function pollForTasks(): Promise<void> {
 }
 
 async function healthCheck(): Promise<void> {
-  // Simple HTTP server for Railway health checks
-  const server = Bun?.serve?.({
-    port: parseInt(process.env.PORT ?? "3000", 10),
-    fetch() {
-      return new Response(
+  const http = await import("http");
+  const port = parseInt(process.env.PORT ?? "3000", 10);
+  http
+    .createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
         JSON.stringify({
           status: "ok",
           activeTasks: activeTasks.size,
           uptime: process.uptime(),
-        }),
-        { headers: { "Content-Type": "application/json" } }
+        })
       );
-    },
-  });
-
-  // Fallback for Node.js (Railway uses Node by default)
-  if (!server) {
-    const http = await import("http");
-    http
-      .createServer((req, res) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            status: "ok",
-            activeTasks: activeTasks.size,
-            uptime: process.uptime(),
-          })
-        );
-      })
-      .listen(parseInt(process.env.PORT ?? "3000", 10));
-  }
+    })
+    .listen(port);
+  console.log(`[orchestrator] Health check listening on port ${port}`);
 }
 
 async function main(): Promise<void> {

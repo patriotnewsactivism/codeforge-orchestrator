@@ -510,6 +510,18 @@ Return ONLY JSON (no markdown):
     onUsage: logModelUsage(ctx, "planner"),
   });
 
+  // The model can return syntactically valid JSON that is still the wrong
+  // shape. Fail loudly here rather than letting `result.subtasks.length`
+  // throw an anonymous "Cannot read properties of undefined" three lines down.
+  if (!result || !Array.isArray(result.subtasks) || result.subtasks.length === 0) {
+    throw new Error(
+      `Planner returned no subtasks. Got: ${JSON.stringify(result).slice(0, 400)}`
+    );
+  }
+  if (typeof result.summary !== "string") {
+    result.summary = `${result.subtasks.length} sub-task(s)`;
+  }
+
   await convexClient.logEvent({
     taskId: ctx.taskId,
     projectId: ctx.projectId,

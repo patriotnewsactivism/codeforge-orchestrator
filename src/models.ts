@@ -207,38 +207,84 @@ async function callOpenAICompatible(
   }
 }
 
-/** Legacy path: Viktor's tool gateway. No token accounting available. */
-async function callViktorGateway(prompt: string): Promise<{ text: string; usage: Usage }> {
-  const response = await fetch(`${config.viktorApiUrl}/api/viktor-spaces/tools/call`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      project_name: config.viktorProjectName,
-      project_secret: config.viktorProjectSecret,
-      role: "quick_ai_search",
-      arguments: { search_question: prompt },
-    }),
-  });
+/**
+ * Fallback path: Viktor's tool gateway.
+ *
+ * NOTE: this used to call `quick_ai_search`, which is a *web search* tool — it
+ * returned search results instead of a model completion, so every agent that
+ * expected generated content (or JSON) got garbage. We use
+ * `ai_structured_output` instead, which is a real model call. We ask for the
+ * completion in a single `response` string field so this stays a drop-in
+ * replacement for a raw text completion: callers that want JSON parse that
+ * string themselves, exactly as they do for the OpenAI-compatible providers.
+ *
+ * No token accounting is available on this path.
+ */
+async function callViktorGateway(
+  prompt: string,
+  timeoutMs: number
+): Promise<{ text: string; usage: Usage }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    throw new Error(`Viktor gateway HTTP ${response.status} — ${await response.text()}`);
+  try {
+    const response = await fetch(`${config.viktorApiUrl}/api/viktor-spaces/tools/call`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        project_name: config.viktorProjectName,
+        project_secret: config.viktorProjectSecret,
+        role: "ai_structured_output",
+        arguments: {
+          prompt,
+          output_schema: {
+            type: "object",
+            properties: {
+              response: {
+                type: "string",
+                description:
+                  "The complete answer. If the instructions ask for JSON, put the raw JSON text here.",
+              },
+            },
+            required: ["response"],
+          },
+          // Agent work is reasoning-heavy; don't cheap out on the fallback.
+          intelligence_level: "smart",
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Viktor gateway HTTP ${response.status} — ${await response.text()}`);
+    }
+
+    // Shape: { success, result: { response_role, result: { response }, error }, error }
+    const json = (await response.json()) as {
+      success: boolean;
+      result?: { result?: { response?: string }; error?: string | null };
+      error?: string | null;
+    };
+
+    if (!json.success) throw new Error(json.error ?? "Viktor gateway call failed");
+    const text = json.result?.result?.response;
+    if (typeof text !== "string" || text.length === 0) {
+      throw new Error(
+        json.result?.error ?? "Viktor gateway returned no completion text"
+      );
+    }
+
+    return { text, usage: EMPTY_USAGE };
+  } finally {
+    clearTimeout(timer);
   }
-
-  const json = (await response.json()) as {
-    success: boolean;
-    result?: { search_response: string };
-    error?: string;
-  };
-  if (!json.success || !json.result) throw new Error(json.error ?? "Viktor gateway returned no result");
-
-  return { text: json.result.search_response, usage: EMPTY_USAGE };
 }
 
 async function invoke(spec: ModelSpec, prompt: string, timeoutMs: number): Promise<ModelResult> {
   const started = Date.now();
   const { text, usage } =
     spec.provider === "viktor"
-      ? await callViktorGateway(prompt)
+      ? await callViktorGateway(prompt, timeoutMs)
       : await callOpenAICompatible(spec, prompt, timeoutMs);
   return { text, spec, usage, durationMs: Date.now() - started };
 }

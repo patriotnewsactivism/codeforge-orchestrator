@@ -1,61 +1,56 @@
 /**
- * AI Module — Calls AI models through the Viktor tool gateway.
- * Uses the same quick_ai_search endpoint that the Convex backend uses.
+ * AI Module — role-aware wrapper over the multi-model router (./models.ts).
+ *
+ * Agents call callAIJson(prompt, { role: "coder", ... }) and the router picks
+ * the right model, escalates on repeated failure, and reports token usage.
+ * Role is optional so older call sites keep working on the default routing.
  */
-import { config } from "./config.js";
+import {
+  callModel,
+  extractJson,
+  isParseableJson,
+  type AgentRole,
+  type ModelResult,
+} from "./models.js";
 
-interface AIResponse {
-  success: boolean;
-  result?: { search_response: string };
-  error?: string;
+export interface AICallOptions {
+  role?: AgentRole;
+  /** 0-based attempt number for this subtask; drives model escalation. */
+  attempt?: number;
+  /** Race against the reasoning model (only if ENABLE_MODEL_RACING=true). */
+  race?: boolean;
+  /** Receives the winning model + token usage, for feed logging. */
+  onUsage?: (result: ModelResult) => void;
 }
 
 /**
- * Call the AI model with a prompt and get a text response.
- * Uses Viktor's tool gateway (quick_ai_search) for model access.
+ * Call the AI model for a role and get raw text back.
  */
-export async function callAI(prompt: string): Promise<string> {
-  const response = await fetch(`${config.viktorApiUrl}/api/viktor-spaces/tools/call`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      project_name: config.viktorProjectName,
-      project_secret: config.viktorProjectSecret,
-      role: "quick_ai_search",
-      arguments: { search_question: prompt },
-    }),
+export async function callAI(prompt: string, opts: AICallOptions = {}): Promise<string> {
+  const result = await callModel(prompt, {
+    role: opts.role ?? "coder",
+    attempt: opts.attempt,
+    race: opts.race,
+    onUsage: opts.onUsage,
   });
-
-  if (!response.ok) {
-    throw new Error(`AI call failed: HTTP ${response.status} — ${await response.text()}`);
-  }
-
-  const json = (await response.json()) as AIResponse;
-  if (!json.success || !json.result) {
-    throw new Error(json.error ?? "AI call returned no result");
-  }
-
-  return json.result.search_response;
+  return result.text;
 }
 
 /**
- * Call AI and parse a JSON response.
- * Tries to extract JSON from the response even if the model wraps it in markdown.
+ * Call the AI model for a role and parse a JSON response.
+ *
+ * JSON-parseability is used as the racing validator, so a model that returns
+ * prose instead of JSON loses the race rather than breaking the task.
  */
-export async function callAIJson<T>(prompt: string): Promise<T> {
-  const raw = await callAI(prompt);
-
-  // Try direct parse first
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    // Try extracting JSON from markdown code blocks or mixed text
-    const jsonMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/) ||
-                      raw.match(/(\{[\s\S]*\})/) ||
-                      raw.match(/(\[[\s\S]*\])/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[1]) as T;
-    }
-    throw new Error(`Failed to parse AI JSON response: ${raw.substring(0, 200)}`);
-  }
+export async function callAIJson<T>(prompt: string, opts: AICallOptions = {}): Promise<T> {
+  const result = await callModel(prompt, {
+    role: opts.role ?? "coder",
+    attempt: opts.attempt,
+    race: opts.race,
+    onUsage: opts.onUsage,
+    validate: isParseableJson,
+  });
+  return extractJson<T>(result.text);
 }
+
+export type { ModelResult, AgentRole };

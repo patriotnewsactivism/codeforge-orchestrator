@@ -5,6 +5,7 @@
  * the entire lifecycle. Runs indefinitely on Railway.
  */
 import { config } from "./config.js";
+import { describeRouting, routingTable } from "./models.js";
 import { convexClient } from "./convex-client.js";
 import { orchestrateTask } from "./agents.js";
 import { cleanupAllSessions } from "./sandbox.js";
@@ -53,6 +54,7 @@ async function healthCheck(): Promise<void> {
           status: "ok",
           activeTasks: activeTasks.size,
           uptime: process.uptime(),
+          modelRouting: routingTable(),
         })
       );
     })
@@ -66,6 +68,7 @@ async function main(): Promise<void> {
   console.log("  Polling interval:", config.pollInterval, "ms");
   console.log("  Max agent depth:", config.maxAgentDepth);
   console.log("  Max concurrent agents:", config.maxConcurrentAgents);
+  console.log("  " + describeRouting());
   console.log("═══════════════════════════════════════════════");
 
   // Start health check server

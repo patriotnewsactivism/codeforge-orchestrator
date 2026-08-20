@@ -32,6 +32,30 @@ export const config = {
   /** Max retry loops for debug/fix cycle */
   maxRetryLoops: parseInt(process.env.MAX_RETRY_LOOPS ?? "5", 10),
 
+  /** ── Multi-model routing (optional — falls back to Viktor gateway) ──
+   * Set OPENROUTER_API_KEY for access to all providers with one key, or set
+   * individual provider keys. Preference order: openrouter → deepseek → xai →
+   * moonshot → viktor gateway. */
+  openrouterKey: process.env.OPENROUTER_API_KEY ?? "",
+  deepseekKey: process.env.DEEPSEEK_API_KEY ?? "",
+  xaiKey: process.env.XAI_API_KEY ?? "",
+  moonshotKey: process.env.MOONSHOT_API_KEY ?? "",
+
+  /** Model id overrides per semantic class. Provider naming drifts, so these
+   * let you correct ids without a code change. */
+  modelReasoning: process.env.MODEL_REASONING ?? "",
+  modelCode: process.env.MODEL_CODE ?? "",
+  modelLongCtx: process.env.MODEL_LONGCTX ?? "",
+
+  /** Escalate to the reasoning model once a subtask has failed this many times */
+  escalateAfterAttempts: parseInt(process.env.ESCALATE_AFTER_ATTEMPTS ?? "2", 10),
+
+  /** Race the role model against the reasoning model on critical paths */
+  enableRacing: (process.env.ENABLE_MODEL_RACING ?? "false") === "true",
+
+  /** Per-call timeout for model requests */
+  modelTimeoutMs: parseInt(process.env.MODEL_TIMEOUT_MS ?? "180000", 10),
+
   /** GitHub integration (optional — set to enable git features) */
   githubRepo: process.env.GITHUB_REPO ?? "",           // "owner/repo"
   githubToken: process.env.GITHUB_TOKEN ?? "",          // PAT with repo scope

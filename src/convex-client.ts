@@ -87,6 +87,28 @@ class ConvexClient {
     return data.tasks;
   }
 
+  /** Claim a pending task for this worker. False means someone else holds it. */
+  async claimTask(taskId: string, workerId: string): Promise<boolean> {
+    const data = await this.post<{ claimed: boolean }>("/api/swarm/claim", {
+      taskId,
+      workerId,
+    });
+    return data.claimed;
+  }
+
+  /** Keep-alive so the task is not reclaimed as abandoned while we work it. */
+  async heartbeatTask(taskId: string, workerId: string): Promise<void> {
+    await this.post("/api/swarm/heartbeat", { taskId, workerId });
+  }
+
+  /** Release tasks stranded by workers that died mid-run. */
+  async reclaimStaleTasks(): Promise<{ requeued: string[]; failed: string[] }> {
+    return await this.post<{ requeued: string[]; failed: string[] }>(
+      "/api/swarm/reclaim",
+      {}
+    );
+  }
+
   async updateTaskStatus(
     taskId: string,
     status: string,

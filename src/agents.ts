@@ -8,6 +8,7 @@
 import { config } from "./config.js";
 import { convexClient, type ConvexFile } from "./convex-client.js";
 import { callAI, callAIJson } from "./ai.js";
+import type { ModelResult } from "./models.js";
 import { validateProject, createSession, execInSandbox, destroySession, type SandboxResult, type ValidationResult } from "./sandbox.js";
 import { isGitEnabled, createBranch, commitFiles, createPR, generateBranchName } from "./git.js";
 
@@ -101,6 +102,33 @@ function buildFileContext(files: ConvexFile[], maxChars = 40000): string {
     ctx += entry;
   }
   return ctx;
+}
+
+/**
+ * Returns an onUsage callback that logs which model answered and what it cost
+ * in tokens, so the live feed shows the swarm's model choices in real time.
+ */
+function logModelUsage(ctx: AgentContext, role: string) {
+  return (result: ModelResult) => {
+    const tokens = result.usage.totalTokens;
+    const tokenText = tokens > 0 ? `${tokens.toLocaleString()} tokens, ` : "";
+    void convexClient.logEvent({
+      taskId: ctx.taskId,
+      projectId: ctx.projectId,
+      agentUid: ctx.agentUid,
+      agentRole: role,
+      type: "model_call",
+      content: `🧠 ${result.spec.label} — ${tokenText}${(result.durationMs / 1000).toFixed(1)}s`,
+      metadata: JSON.stringify({
+        provider: result.spec.provider,
+        model: result.spec.model,
+        promptTokens: result.usage.promptTokens,
+        completionTokens: result.usage.completionTokens,
+        totalTokens: result.usage.totalTokens,
+        durationMs: result.durationMs,
+      }),
+    });
+  };
 }
 
 /**
@@ -355,7 +383,7 @@ Return ONLY JSON (no markdown):
 }`;
 
   try {
-    const result = await callAIJson<RetrospectiveOutput>(prompt);
+    const result = await callAIJson<RetrospectiveOutput>(prompt, { role: "retrospective" });
 
     // Store memories
     const memoryIds: string[] = [];
@@ -477,7 +505,10 @@ Return ONLY JSON (no markdown):
   "summary": "Brief plan summary"
 }`;
 
-  const result = await callAIJson<PlannerOutput>(prompt);
+  const result = await callAIJson<PlannerOutput>(prompt, {
+    role: "planner",
+    onUsage: logModelUsage(ctx, "planner"),
+  });
 
   await convexClient.logEvent({
     taskId: ctx.taskId,
@@ -529,7 +560,10 @@ Return ONLY JSON (no markdown):
   "summary": "What architecture decisions were made"
 }`;
 
-  const result = await callAIJson<CoderOutput>(prompt);
+  const result = await callAIJson<CoderOutput>(prompt, {
+    role: "architect",
+    onUsage: logModelUsage(ctx, "architect"),
+  });
 
   // Write files
   for (const change of result.changes) {
@@ -565,7 +599,8 @@ Return ONLY JSON (no markdown):
 
 export async function runCoder(
   ctx: AgentContext,
-  files: ConvexFile[]
+  files: ConvexFile[],
+  attempt = 0
 ): Promise<CoderOutput> {
   await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "running");
   await convexClient.logEvent({
@@ -604,7 +639,11 @@ Return ONLY JSON (no markdown):
   "summary": "What was implemented"
 }`;
 
-  const result = await callAIJson<CoderOutput>(prompt);
+  const result = await callAIJson<CoderOutput>(prompt, {
+    role: "coder",
+    attempt,
+    onUsage: logModelUsage(ctx, "coder"),
+  });
 
   // Write files
   const changedFiles: string[] = [];
@@ -652,7 +691,8 @@ Return ONLY JSON (no markdown):
 
 export async function runTester(
   ctx: AgentContext,
-  files: ConvexFile[]
+  files: ConvexFile[],
+  attempt = 0
 ): Promise<{ validation: ValidationResult; coderOutput?: CoderOutput }> {
   await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "running");
   await convexClient.logEvent({
@@ -738,7 +778,12 @@ Return ONLY JSON (no markdown):
 }`;
 
   try {
-    const fixes = await callAIJson<CoderOutput>(fixPrompt);
+    const fixes = await callAIJson<CoderOutput>(fixPrompt, {
+      role: "tester",
+      attempt,
+      race: true,
+      onUsage: logModelUsage(ctx, "tester"),
+    });
 
     // Write fixes
     for (const change of fixes.changes) {
@@ -782,7 +827,8 @@ Return ONLY JSON (no markdown):
 export async function runDebugger(
   ctx: AgentContext,
   files: ConvexFile[],
-  errorContext?: string
+  errorContext?: string,
+  attempt = 0
 ): Promise<CoderOutput> {
   await convexClient.updateAgentStatus(ctx.taskId, ctx.agentUid, "running");
   await convexClient.logEvent({
@@ -841,7 +887,12 @@ Return ONLY JSON (no markdown):
   "summary": "What bugs were found and fixed"
 }`;
 
-  const result = await callAIJson<CoderOutput>(prompt);
+  const result = await callAIJson<CoderOutput>(prompt, {
+    role: "debugger",
+    attempt,
+    race: true,
+    onUsage: logModelUsage(ctx, "debugger"),
+  });
 
   for (const change of result.changes) {
     const cleanContent = change.content
@@ -978,7 +1029,10 @@ Return ONLY JSON (no markdown):
   "summary": "Overall assessment"
 }`;
 
-  const result = await callAIJson<ReviewerOutput>(prompt);
+  const result = await callAIJson<ReviewerOutput>(prompt, {
+    role: "reviewer",
+    onUsage: logModelUsage(ctx, "reviewer"),
+  });
 
   // If sandbox failed, force rejection regardless of AI opinion
   if (!validation.passed && result.approved) {
@@ -1291,7 +1345,8 @@ export async function orchestrateTask(task: {
               parentAgentUid: reviewerUid,
             },
             files,
-            issuesSummary
+            issuesSummary,
+            retryCount
           );
           totalFilesChanged += debugResult.changes.length;
           files = await convexClient.getProjectFiles(projectId);
